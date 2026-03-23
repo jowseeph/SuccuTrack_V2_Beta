@@ -5,14 +5,47 @@ if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'admin') {
 }
 require_once __DIR__ . '/../config/config.php';
 
-$msg = "";
+$msg = $error = "";
 
-// Mark user as active when admin assigns a plant (triggered via ?activate=uid)
-if (isset($_GET['activated'])) {
-    $msg = "Plants assigned and user account activated.";
+// ── Admin reject a recommended user ──────────────────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_reject_uid'])) {
+    $ruid = intval($_POST['admin_reject_uid']);
+    $note = trim($_POST['admin_reject_note'] ?? '');
+    $stmt = $pdo->prepare("SELECT user_id, username, status FROM users WHERE user_id=? AND role='user'");
+    $stmt->execute([$ruid]);
+    $rrow = $stmt->fetch();
+    if ($rrow && in_array($rrow['status'], ['pending','recommended'], true)) {
+        $pdo->prepare("UPDATE users SET status='rejected' WHERE user_id=?")->execute([$ruid]);
+        $pdo->prepare("UPDATE notifications SET is_read=1 WHERE for_role='admin' AND ref_user_id=?")->execute([$ruid]);
+        notify_manager_rejected($pdo, $ruid, $rrow['username'], $_SESSION['username']);
+        log_status_change($pdo, $ruid, (int)$_SESSION['user_id'], $rrow['status'], 'rejected', $note);
+        $msg = "❌ @{$rrow['username']} has been rejected.";
+    } else {
+        $error = "User not found or cannot be rejected at this stage.";
+    }
 }
 
-// Load users needing admin action (pending OR recommended)
+// ── Unread notification badge ─────────────────────────────────────────────────
+$_adminUnread = get_unread_count($pdo, 'admin');
+
+// ── Deletion of humidity log entries ─────────────────────────────────────────
+if (($_GET['action'] ?? '') === 'delete_log') {
+    $log_id      = intval($_GET['log_id']      ?? 0);
+    $humidity_id = intval($_GET['humidity_id'] ?? 0);
+    if ($humidity_id) {
+        if ($log_id) {
+            $pdo->prepare("DELETE FROM user_logs WHERE log_id=?")->execute([$log_id]);
+        } else {
+            $pdo->prepare("DELETE FROM user_logs WHERE humidity_id=?")->execute([$humidity_id]);
+        }
+        $pdo->prepare("DELETE FROM humidity WHERE humidity_id=?")->execute([$humidity_id]);
+    }
+    redirect_to("admin/dashboard.php?deleted=1"); exit;
+}
+if (isset($_GET['activated'])) $msg = "Plants assigned and user account activated.";
+if (isset($_GET['deleted']))   $msg = "Record deleted successfully.";
+
+// ── Onboarding users (pending OR recommended) ─────────────────────────────────
 $onboardingUsers = $pdo->query("
     SELECT user_id, username, email, status, created_at,
            (SELECT COUNT(*) FROM plants WHERE user_id = users.user_id) AS plant_count
@@ -22,24 +55,7 @@ $onboardingUsers = $pdo->query("
 ")->fetchAll();
 $onboardingCount = count($onboardingUsers);
 
-// Unread notification count for admin badge
-$_adminUnread = get_unread_count($pdo, 'admin');
-if (($_GET['action'] ?? '') === 'delete_log') {
-    $log_id      = intval($_GET['log_id']      ?? 0);
-    $humidity_id = intval($_GET['humidity_id'] ?? 0);
-    if ($humidity_id) {
-        if ($log_id) {
-            $pdo->prepare("DELETE FROM user_logs WHERE log_id = ?")->execute([$log_id]);
-        } else {
-            $pdo->prepare("DELETE FROM user_logs WHERE humidity_id = ?")->execute([$humidity_id]);
-        }
-        $pdo->prepare("DELETE FROM humidity WHERE humidity_id = ?")->execute([$humidity_id]);
-    }
-    redirect_to("admin/dashboard.php?deleted=1"); exit;
-}
-if (isset($_GET['deleted'])) $msg = "Record deleted successfully.";
-
-// ── Core stats ─────────────────────────────────────────────────────────────
+// ── Core stats ────────────────────────────────────────────────────────────────
 $users  = $pdo->query("SELECT user_id, username, email, role, COALESCE(status,'active') AS status, created_at FROM users ORDER BY created_at DESC")->fetchAll();
 $counts = $pdo->query("SELECT status, COUNT(*) as total FROM humidity GROUP BY status")->fetchAll();
 $stats  = array_column($counts, 'total', 'status');
@@ -73,9 +89,16 @@ $logs = $pdo->query("
     ORDER BY h.recorded_at DESC LIMIT 200
 ")->fetchAll();
 
-// ── Humidity-based chart data (NOT log counts) ─────────────────────────────
+// Onboarding audit log
+$onboardLog = $pdo->query("
+    SELECT ol.*, u.username AS subject, a.username AS actor
+    FROM onboarding_log ol
+    JOIN users u ON ol.user_id  = u.user_id
+    JOIN users a ON ol.actor_id = a.user_id
+    ORDER BY ol.created_at DESC LIMIT 50
+")->fetchAll();
 
-// Global: average humidity % per day, last 30 days
+// ── Chart data ────────────────────────────────────────────────────────────────
 $globalHumidity = $pdo->query("
     SELECT DATE(recorded_at) AS day,
            ROUND(AVG(humidity_percent),1) AS avg_pct,
@@ -86,19 +109,11 @@ $globalHumidity = $pdo->query("
     ORDER BY day ASC
 ")->fetchAll();
 
-// Per-plant: actual humidity % readings over time
 $PALETTE = ['#4f63d8','#0d7c6b','#c0430e','#8b5cf6','#d97706','#059669','#db2777'];
 $plantHumidityData = [];
 foreach ($plants as $i => $p) {
     $pid = (int)$p['plant_id'];
-    $rows = $pdo->prepare("
-        SELECT humidity_percent, status,
-               UNIX_TIMESTAMP(recorded_at) AS ts,
-               recorded_at
-        FROM humidity
-        WHERE plant_id = ?
-        ORDER BY recorded_at ASC LIMIT 50
-    ");
+    $rows = $pdo->prepare("SELECT humidity_percent, status, UNIX_TIMESTAMP(recorded_at) AS ts, recorded_at FROM humidity WHERE plant_id=? ORDER BY recorded_at ASC LIMIT 50");
     $rows->execute([$pid]);
     $plantHumidityData[] = [
         'pid'    => $pid,
@@ -124,6 +139,26 @@ $activePage = 'admin_dashboard';
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/datatables/1.10.21/js/jquery.dataTables.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+.pill-rejected{background:#fee2e2;color:#991b1b;border:1px solid #fca5a5;}
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px;}
+.modal-box{background:var(--surface,#fff);border-radius:12px;padding:26px 28px;width:100%;max-width:440px;box-shadow:0 8px 32px rgba(0,0,0,.18);}
+.modal-box h3{margin:0 0 6px;font-size:1rem;color:var(--text,#0f172a);}
+.modal-box p{font-size:.8rem;color:var(--text-3,#64748b);margin:0 0 16px;}
+.modal-box textarea{width:100%;border:1px solid var(--border,#e2e8f0);border-radius:8px;padding:10px 12px;font-size:.83rem;resize:vertical;min-height:80px;box-sizing:border-box;font-family:inherit;}
+.modal-actions{display:flex;gap:10px;margin-top:16px;justify-content:flex-end;}
+.onboard-info-admin{background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:11px 14px;font-size:.8rem;color:#1e40af;margin-bottom:14px;display:flex;align-items:flex-start;gap:8px;}
+.timeline{list-style:none;padding:0;margin:0;}
+.timeline li{display:flex;gap:12px;padding:10px 0;border-bottom:1px solid var(--border,#e2e8f0);}
+.timeline li:last-child{border-bottom:none;}
+.tl-dot{width:10px;height:10px;border-radius:50%;margin-top:5px;flex-shrink:0;}
+.tl-dot.approved{background:#1a6e3c;}.tl-dot.rejected{background:#dc2626;}
+.tl-dot.activated{background:#1656a3;}.tl-dot.pending{background:#f59e0b;}
+.tl-body{flex:1;min-width:0;}
+.tl-title{font-size:.8rem;font-weight:600;color:var(--text,#0f172a);}
+.tl-meta{font-size:.72rem;color:var(--text-3,#94a3b8);margin-top:2px;}
+.tl-note{font-size:.75rem;color:var(--text-2,#64748b);margin-top:4px;font-style:italic;}
+</style>
 </head>
 <body class="role-admin">
 <div class="app-layout">
@@ -148,9 +183,8 @@ $activePage = 'admin_dashboard';
     </header>
 
     <div class="page-body">
-      <?php if ($msg): ?>
-        <div class="alert alert-success">✅ <?= htmlspecialchars($msg) ?></div>
-      <?php endif; ?>
+      <?php if ($msg):   ?><div class="alert alert-success">✅ <?= htmlspecialchars($msg) ?></div><?php endif; ?>
+      <?php if ($error): ?><div class="alert alert-error">⚠️ <?= htmlspecialchars($error) ?></div><?php endif; ?>
 
       <div class="pg-header">
         <h1>System Overview</h1>
@@ -173,99 +207,36 @@ $activePage = 'admin_dashboard';
         <?php endif; ?>
       </div>
 
-      <!-- Chart row: global humidity trend + status donut -->
-      <div id="charts-section" style="scroll-margin-top:60px;">
+      <!-- Charts -->
       <div class="two-col" style="margin-bottom:20px;">
         <div class="card" style="margin-bottom:0;">
-          <div class="card-header">
-            <div>
-              <div class="card-title">📈 Global Humidity Trend</div>
-              <div class="card-subtitle">Average humidity % per day · last 30 days</div>
-            </div>
-          </div>
+          <div class="card-header"><div><div class="card-title">📈 Global Humidity Trend</div><div class="card-subtitle">Average % per day · last 30 days</div></div></div>
           <div style="height:210px;"><canvas id="globalHumidityChart"></canvas></div>
         </div>
         <div class="card" style="margin-bottom:0;">
-          <div class="card-header">
-            <div>
-              <div class="card-title">🍩 Status Distribution</div>
-              <div class="card-subtitle">All-time readings by classification</div>
-            </div>
-          </div>
+          <div class="card-header"><div><div class="card-title">🍩 Status Distribution</div><div class="card-subtitle">All-time readings</div></div></div>
           <div style="height:210px;"><canvas id="statusDonut"></canvas></div>
         </div>
       </div>
 
-      <!-- Per-plant humidity charts -->
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <div class="card-title">🪴 Per-Plant Humidity History</div>
-            <div class="card-subtitle">Actual humidity % readings per device (last 50 each)</div>
-          </div>
-        </div>
-        <?php if (empty($plantHumidityData)): ?>
-          <p class="chart-empty">No plant data yet.</p>
-        <?php else: ?>
-        <!-- Summary: current humidity per plant -->
-        <div style="height:200px;margin-bottom:16px;"><canvas id="plantCurrentChart"></canvas></div>
-        <div class="chart-legend" style="margin-bottom:20px;">
-          <?php foreach ($plantHumidityData as $pd): ?>
-          <div class="legend-item">
-            <div class="legend-dot" style="background:<?= $pd['color'] ?>"></div>
-            <?= htmlspecialchars($pd['name']) ?>
-            <?php if ($pd['latest']): ?>
-              <span style="color:var(--text-3);font-size:.68rem;">(<?= $pd['latest'] ?>%
-              <?php if ($pd['status']): ?>
-                <span class="badge badge-<?= strtolower($pd['status']) ?>" style="font-size:.58rem;padding:1px 6px;"><?= $pd['status'] ?></span>
-              <?php endif; ?>)</span>
-            <?php endif; ?>
-          </div>
-          <?php endforeach; ?>
-        </div>
-        <!-- Individual mini charts -->
-        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:14px;">
-          <?php foreach ($plantHumidityData as $pd): ?>
-          <div class="chart-wrap" style="margin:0;">
-            <div class="chart-header">
-              <span class="chart-title">🪴 <?= htmlspecialchars($pd['name']) ?></span>
-              <span class="chart-count"><?= $pd['total'] ?> readings</span>
-            </div>
-            <?php if (empty($pd['rows'])): ?>
-              <p class="chart-empty">No data yet</p>
-            <?php else: ?>
-            <div style="height:100px;"><canvas id="plant-humidity-<?= $pd['pid'] ?>"></canvas></div>
-            <?php endif; ?>
-          </div>
-          <?php endforeach; ?>
-        </div>
-        <?php endif; ?>
-      </div>
-
-      </div><!-- /charts-section -->
       <!-- Data tables -->
       <div class="card">
-        <div class="card-header">
-          <div>
-            <div class="card-title">📋 System Data</div>
-            <div class="card-subtitle">Browse and manage all records · Asia/Manila (PHT, UTC+8)</div>
-          </div>
-        </div>
+        <div class="card-header"><div><div class="card-title">📋 System Data</div><div class="card-subtitle">Browse and manage all records · PHT (UTC+8)</div></div></div>
         <div class="tab-nav">
-          <button class="tab-btn <?= $onboardingCount > 0 ? '' : '' ?>" onclick="switchTab('tab-onboarding',event)"
-                  style="position:relative;">
+          <button class="tab-btn" onclick="switchTab('tab-onboarding',event)" style="position:relative;" id="tab-onboarding-btn">
             🔔 Onboarding
             <?php if ($onboardingCount > 0): ?>
             <span style="position:absolute;top:-5px;right:-5px;min-width:16px;height:16px;padding:0 4px;border-radius:10px;background:#f59e0b;color:#fff;font-size:.58rem;font-weight:700;display:inline-flex;align-items:center;justify-content:center;"><?= $onboardingCount ?></span>
             <?php endif; ?>
           </button>
+          <button class="tab-btn"        onclick="switchTab('tab-log',event)">📜 Audit Log</button>
           <button class="tab-btn active" onclick="switchTab('tab-users',event)">👤 Users (<?= count($users) ?>)</button>
           <button class="tab-btn"        onclick="switchTab('tab-plants',event)">🪴 Plants (<?= count($plants) ?>)</button>
           <button class="tab-btn"        onclick="switchTab('tab-humidity',event)">💧 Readings (<?= count($humidity) ?>)</button>
           <button class="tab-btn"        onclick="switchTab('tab-logs',event)">📋 Logs (<?= count($logs) ?>)</button>
         </div>
 
-        <!-- Onboarding panel -->
+        <!-- ── ONBOARDING tab ─────────────────────────────────────────────── -->
         <div class="tab-panel" id="tab-onboarding">
           <?php if (empty($onboardingUsers)): ?>
           <div style="text-align:center;padding:28px 0;">
@@ -274,34 +245,41 @@ $activePage = 'admin_dashboard';
             <p style="font-size:.74rem;color:var(--text-3);">All users have been processed and plants assigned.</p>
           </div>
           <?php else: ?>
-          <div class="onboard-info-bar onboard-info-admin">
+          <div class="onboard-info-admin">
             📋 <strong><?= $onboardingCount ?> user<?= $onboardingCount > 1 ? 's' : '' ?></strong> need your attention.
-            Users marked <strong>Recommended</strong> have been approved by a Manager — assign plants to activate them.
+            Users marked <strong>Awaiting Plants</strong> were approved by a Manager — assign plants to activate them.
+            You may also reject any user at this stage.
           </div>
           <div class="table-wrap">
             <table class="det-table">
               <thead>
-                <tr><th>#</th><th>Username</th><th>Email</th><th>Registered (PHT)</th><th>Status</th><th>Plants</th><th>Action</th></tr>
+                <tr><th>#</th><th>Username</th><th>Email</th><th>Registered (PHT)</th><th>Status</th><th>Plants</th><th>Actions</th></tr>
               </thead>
               <tbody>
-                <?php foreach ($onboardingUsers as $ou): ?>
+                <?php foreach ($onboardingUsers as $ou):
+                  $si = user_status_label($ou['status']); ?>
                 <tr>
                   <td><?= $ou['user_id'] ?></td>
                   <td><strong>@<?= htmlspecialchars($ou['username']) ?></strong></td>
                   <td><?= htmlspecialchars($ou['email']) ?></td>
                   <td><?= date('M d, Y H:i', strtotime($ou['created_at'])) ?></td>
-                  <td><?php
-                    $st = $ou['status'];
-                    $pillMap = ['pending'=>'pill-pending','recommended'=>'pill-recommended'];
-                    $lblMap  = ['pending'=>'⏳ Pending','recommended'=>'📋 Recommended'];
-                    echo '<span class="status-pill '.($pillMap[$st]??'').'">'.($lblMap[$st]??ucfirst($st)).'</span>';
-                  ?></td>
+                  <td><span class="status-pill <?= $si['pill'] ?>"><?= $si['label'] ?></span></td>
                   <td><?= $ou['plant_count'] ?> assigned</td>
                   <td>
-                    <a href="manage_plants.php?user_id=<?= $ou['user_id'] ?>&username=<?= urlencode($ou['username']) ?>"
-                       class="btn btn-primary" style="font-size:.7rem;padding:4px 11px;">
-                      🪴 Assign Plants
-                    </a>
+                    <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                      <!-- Assign plants (only for recommended users) -->
+                      <?php if ($ou['status'] === 'recommended'): ?>
+                      <a href="manage_plants.php?user_id=<?= $ou['user_id'] ?>&username=<?= urlencode($ou['username']) ?>"
+                         class="btn btn-primary" style="font-size:.7rem;padding:4px 10px;">
+                        🪴 Assign Plants
+                      </a>
+                      <?php endif; ?>
+                      <!-- Reject -->
+                      <button type="button" class="btn btn-danger" style="font-size:.7rem;padding:4px 10px;"
+                              onclick="openAdminRejectModal(<?= $ou['user_id'] ?>,'<?= htmlspecialchars($ou['username'],ENT_QUOTES) ?>')">
+                        ❌ Reject
+                      </button>
+                    </div>
                   </td>
                 </tr>
                 <?php endforeach; ?>
@@ -311,28 +289,66 @@ $activePage = 'admin_dashboard';
           <?php endif; ?>
         </div>
 
+        <!-- ── AUDIT LOG tab ──────────────────────────────────────────────── -->
+        <div class="tab-panel" id="tab-log">
+          <?php if (empty($onboardLog)): ?>
+          <div style="text-align:center;padding:24px 0;font-size:.8rem;color:var(--text-3);">No onboarding activity yet.</div>
+          <?php else: ?>
+          <ul class="timeline" style="padding:12px 16px;">
+            <?php foreach ($onboardLog as $entry):
+              $dotClass = match($entry['to_status']) {
+                'recommended' => 'approved',
+                'rejected'    => 'rejected',
+                'active'      => 'activated',
+                default       => 'pending',
+              };
+              $actionLabel = match($entry['to_status']) {
+                'recommended' => 'approved',
+                'rejected'    => 'rejected',
+                'active'      => 'activated',
+                default       => $entry['to_status'],
+              };
+            ?>
+            <li>
+              <div class="tl-dot <?= $dotClass ?>"></div>
+              <div class="tl-body">
+                <div class="tl-title">
+                  @<?= htmlspecialchars($entry['actor']) ?> <?= $actionLabel ?>
+                  @<?= htmlspecialchars($entry['subject']) ?>
+                </div>
+                <div class="tl-meta">
+                  <?= date('M d, Y H:i', strtotime($entry['created_at'])) ?> PHT &middot;
+                  <?= htmlspecialchars($entry['from_status']) ?> → <?= htmlspecialchars($entry['to_status']) ?>
+                </div>
+                <?php if ($entry['note']): ?>
+                <div class="tl-note">"<?= htmlspecialchars($entry['note']) ?>"</div>
+                <?php endif; ?>
+              </div>
+            </li>
+            <?php endforeach; ?>
+          </ul>
+          <?php endif; ?>
+        </div>
+
+        <!-- Users tab -->
         <div class="tab-panel active" id="tab-users">
           <div class="table-wrap">
             <table id="dt-users" class="det-table" style="width:100%">
               <thead><tr><th>#</th><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Joined (PHT)</th><th>Action</th></tr></thead>
               <tbody>
-                <?php foreach ($users as $u): ?>
+                <?php foreach ($users as $u):
+                  $si = user_status_label($u['status'] ?? 'active'); ?>
                 <tr>
                   <td><?= $u['user_id'] ?></td>
                   <td><strong><?= htmlspecialchars($u['username']) ?></strong></td>
                   <td><?= htmlspecialchars($u['email']) ?></td>
                   <td><span class="badge badge-<?= $u['role'] ?>"><?= $u['role'] ?></span></td>
-                  <td><?php
-                    $ust = $u['status'] ?? 'active';
-                    $pm = ['pending'=>'pill-pending','recommended'=>'pill-recommended','active'=>'pill-active'];
-                    $lm = ['pending'=>'⏳ Pending','recommended'=>'📋 Recommended','active'=>'✅ Active'];
-                    echo '<span class="status-pill '.($pm[$ust]??'pill-active').'">'.($lm[$ust]??ucfirst($ust)).'</span>';
-                  ?></td>
+                  <td><span class="status-pill <?= $si['pill'] ?>"><?= $si['label'] ?></span></td>
                   <td data-order="<?= $u['created_at'] ?>"><?= date('M d, Y', strtotime($u['created_at'])) ?></td>
                   <td>
                     <?php if ($u['user_id'] !== $_SESSION['user_id']): ?>
                     <a href="../api/delete_user.php?id=<?= $u['user_id'] ?>" class="btn btn-danger"
-                       onclick="return confirm('Delete <?= htmlspecialchars($u['username'], ENT_QUOTES) ?>?')">Delete</a>
+                       onclick="return confirm('Delete <?= htmlspecialchars($u['username'],ENT_QUOTES) ?>?')">Delete</a>
                     <?php else: ?><span class="you-label">You</span><?php endif; ?>
                   </td>
                 </tr>
@@ -342,6 +358,7 @@ $activePage = 'admin_dashboard';
           </div>
         </div>
 
+        <!-- Plants tab -->
         <div class="tab-panel" id="tab-plants">
           <div class="table-wrap">
             <table id="dt-plants" class="det-table" style="width:100%">
@@ -364,6 +381,7 @@ $activePage = 'admin_dashboard';
           </div>
         </div>
 
+        <!-- Humidity tab -->
         <div class="tab-panel" id="tab-humidity">
           <div class="table-wrap">
             <table id="dt-humidity" class="det-table" style="width:100%">
@@ -377,11 +395,7 @@ $activePage = 'admin_dashboard';
                   <td><strong><?= $h['humidity_percent'] ?>%</strong></td>
                   <td><span class="badge badge-<?= strtolower($h['status']) ?>"><?= $h['status'] ?></span></td>
                   <td data-order="<?= $h['recorded_at'] ?>"><?= date('M d, Y H:i', strtotime($h['recorded_at'])) ?></td>
-                  <td>
-                    <a href="dashboard.php?action=delete_log&log_id=0&humidity_id=<?= $h['humidity_id'] ?>"
-                       class="btn btn-danger"
-                       onclick="return confirm('Delete this reading and its log entries?')">Delete</a>
-                  </td>
+                  <td><a href="dashboard.php?action=delete_log&log_id=0&humidity_id=<?= $h['humidity_id'] ?>" class="btn btn-danger" onclick="return confirm('Delete this reading?')">Delete</a></td>
                 </tr>
                 <?php endforeach; ?>
               </tbody>
@@ -389,6 +403,7 @@ $activePage = 'admin_dashboard';
           </div>
         </div>
 
+        <!-- Logs tab -->
         <div class="tab-panel" id="tab-logs">
           <div class="table-wrap">
             <table id="dt-logs" class="det-table" style="width:100%">
@@ -402,11 +417,7 @@ $activePage = 'admin_dashboard';
                   <td><strong><?= $r['humidity_percent'] ?>%</strong></td>
                   <td><span class="badge badge-<?= strtolower($r['status']) ?>"><?= $r['status'] ?></span></td>
                   <td data-order="<?= $r['recorded_at'] ?>"><?= date('M d, Y H:i', strtotime($r['recorded_at'])) ?></td>
-                  <td>
-                    <a href="dashboard.php?action=delete_log&log_id=<?= $r['log_id'] ?>&humidity_id=<?= $r['humidity_id'] ?>"
-                       class="btn btn-danger"
-                       onclick="return confirm('Delete this record?')">Delete</a>
-                  </td>
+                  <td><a href="dashboard.php?action=delete_log&log_id=<?= $r['log_id'] ?>&humidity_id=<?= $r['humidity_id'] ?>" class="btn btn-danger" onclick="return confirm('Delete this record?')">Delete</a></td>
                 </tr>
                 <?php endforeach; ?>
               </tbody>
@@ -419,149 +430,85 @@ $activePage = 'admin_dashboard';
   </div><!-- /main-content -->
 </div><!-- /app-layout -->
 
+<!-- ── Admin reject modal ────────────────────────────────────────────────────── -->
+<div class="modal-backdrop" id="admin-reject-modal" style="display:none;" onclick="if(event.target===this)closeAdminRejectModal()">
+  <div class="modal-box">
+    <h3>❌ Reject user</h3>
+    <p>Optionally provide a reason. The manager who recommended this user will be notified.</p>
+    <form method="POST" id="admin-reject-form">
+      <input type="hidden" name="admin_reject_uid"  id="admin-reject-uid-input">
+      <textarea name="admin_reject_note" id="admin-reject-note-input" placeholder="Reason for rejection (optional)…"></textarea>
+      <div class="modal-actions">
+        <button type="button" class="btn" onclick="closeAdminRejectModal()">Cancel</button>
+        <button type="submit" class="btn btn-danger">Confirm Reject</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <script>
-// ── Tab switching ───────────────────────────────────────────────────────────
+// ── Reject modal ──────────────────────────────────────────────────────────────
+function openAdminRejectModal(uid, username) {
+  document.getElementById('admin-reject-uid-input').value  = uid;
+  document.getElementById('admin-reject-note-input').value = '';
+  document.getElementById('admin-reject-modal').style.display = 'flex';
+}
+function closeAdminRejectModal() {
+  document.getElementById('admin-reject-modal').style.display = 'none';
+}
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
 function switchTab(id, ev) {
-  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
   document.getElementById(id).classList.add('active');
   ev.currentTarget.classList.add('active');
   const map = {'tab-users':'#dt-users','tab-plants':'#dt-plants','tab-humidity':'#dt-humidity','tab-logs':'#dt-logs'};
   if (map[id]) $(map[id]).DataTable().columns.adjust().draw(false);
+  // Mark admin notifications as read when onboarding tab is opened
+  if (id === 'tab-onboarding') {
+    fetch('../api/mark_notifications_read.php?role=admin', {method:'POST'}).catch(()=>{});
+  }
 }
 
-// ── DataTables ──────────────────────────────────────────────────────────────
+// Auto-jump to onboarding tab if ?jumptab=tab-onboarding
+(function(){
+  const p = new URLSearchParams(location.search).get('jumptab');
+  if (p) {
+    const btn = document.getElementById(p + '-btn') ||
+                document.querySelector(`[onclick*="'${p}'"]`);
+    if (btn) btn.click();
+  }
+})();
+
+// ── DataTables ────────────────────────────────────────────────────────────────
 $(document).ready(function () {
   const opts = {
     pageLength: 10, lengthMenu: [5,10,25,50],
     language: { search:'Search:', lengthMenu:'Show _MENU_ entries',
       info:'Showing _START_–_END_ of _TOTAL_', paginate:{previous:'‹',next:'›'} }
   };
-  $('#dt-users').DataTable({ ...opts, order:[[4,'desc']], columnDefs:[{targets:5,orderable:false}] });
+  $('#dt-users').DataTable({ ...opts, order:[[4,'desc']], columnDefs:[{targets:6,orderable:false}] });
   $('#dt-plants').DataTable({ ...opts, order:[[7,'desc']] });
   $('#dt-humidity').DataTable({ ...opts, order:[[5,'desc']], columnDefs:[{targets:6,orderable:false}] });
   $('#dt-logs').DataTable({ ...opts, order:[[5,'desc']], columnDefs:[{targets:6,orderable:false}] });
 });
 
-// ── Shared chart options ────────────────────────────────────────────────────
-const FONT  = 'Plus Jakarta Sans';
+// ── Charts ────────────────────────────────────────────────────────────────────
+const FONT = 'inherit';
 const gridColor = 'rgba(0,0,0,.05)';
-
-// ── 1. Global Humidity Trend (avg % per day) ────────────────────────────────
 const gDays = <?= json_encode(array_column($globalHumidity, 'day')) ?>;
 const gAvg  = <?= json_encode(array_map(fn($r)=>(float)$r['avg_pct'], $globalHumidity)) ?>;
-
 new Chart(document.getElementById('globalHumidityChart'), {
-  type: 'line',
-  data: {
-    labels: gDays,
-    datasets: [{
-      label: 'Avg Humidity %',
-      data: gAvg,
-      borderColor: '#4f63d8',
-      backgroundColor: 'rgba(79,99,216,.07)',
-      borderWidth: 2.5, fill: true, tension: 0.4,
-      pointRadius: 4, pointBackgroundColor: '#4f63d8',
-      pointBorderColor: '#fff', pointBorderWidth: 2,
-    }]
-  },
-  options: {
-    responsive: true, maintainAspectRatio: false,
-    plugins: { legend:{display:false}, tooltip:{callbacks:{label:c=>' '+c.parsed.y+'%'}} },
-    scales: {
-      x: { ticks:{font:{size:9,family:FONT},maxTicksLimit:9,maxRotation:30}, grid:{color:gridColor} },
-      y: { min:0, max:100,
-           ticks:{font:{size:9,family:FONT},callback:v=>v+'%',stepSize:20}, grid:{color:gridColor} }
-    }
-  }
+  type:'line',
+  data:{labels:gDays,datasets:[{label:'Avg Humidity %',data:gAvg,borderColor:'#4f63d8',backgroundColor:'rgba(79,99,216,.07)',borderWidth:2.5,fill:true,tension:0.4,pointRadius:4,pointBackgroundColor:'#4f63d8',pointBorderColor:'#fff',pointBorderWidth:2}]},
+  options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>' '+c.parsed.y+'%'}}},scales:{x:{ticks:{font:{size:9},maxTicksLimit:9,maxRotation:30},grid:{color:gridColor}},y:{min:0,max:100,ticks:{font:{size:9},callback:v=>v+'%',stepSize:20},grid:{color:gridColor}}}}
 });
-
-// ── 2. Status Distribution Donut ────────────────────────────────────────────
 new Chart(document.getElementById('statusDonut'), {
-  type: 'doughnut',
-  data: {
-    labels: ['Dry','Ideal','Humid'],
-    datasets: [{ data: [<?= (int)($stats['Dry']??0) ?>,<?= (int)($stats['Ideal']??0) ?>,<?= (int)($stats['Humid']??0) ?>],
-      backgroundColor: ['#c0430e','#1a6e3c','#1656a3'],
-      borderColor: '#fff', borderWidth: 3, hoverOffset: 6 }]
-  },
-  options: {
-    responsive: true, maintainAspectRatio: false,
-    plugins: { legend: { position:'bottom', labels:{font:{size:11,family:FONT},padding:14,usePointStyle:true} } }
-  }
+  type:'doughnut',
+  data:{labels:['Dry','Ideal','Humid'],datasets:[{data:[<?= (int)($stats['Dry']??0) ?>,<?= (int)($stats['Ideal']??0) ?>,<?= (int)($stats['Humid']??0) ?>],backgroundColor:['#c0430e','#1a6e3c','#1656a3'],borderColor:'#fff',borderWidth:3,hoverOffset:6}]},
+  options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{font:{size:11},padding:14,usePointStyle:true}}}}
 });
-
-// ── 3. Per-plant current humidity bar chart ─────────────────────────────────
-const plantNames  = <?= json_encode(array_column($plantHumidityData,'name')) ?>;
-const plantLatest = <?= json_encode(array_map(fn($p)=>(float)($p['latest']??0), $plantHumidityData)) ?>;
-const plantStatus = <?= json_encode(array_column($plantHumidityData,'status')) ?>;
-const plantColors = <?= json_encode(array_column($plantHumidityData,'color')) ?>;
-
-// Colour bars by status
-const statusBarColors = plantStatus.map(s => s==='Dry'?'#c0430e' : s==='Ideal'?'#1a6e3c' : s==='Humid'?'#1656a3' : '#9ca3af');
-
-new Chart(document.getElementById('plantCurrentChart'), {
-  type: 'bar',
-  data: {
-    labels: plantNames,
-    datasets: [{
-      label: 'Current Humidity %',
-      data: plantLatest,
-      backgroundColor: statusBarColors.map(c => c+'bb'),
-      borderColor: statusBarColors,
-      borderWidth: 2, borderRadius: 8,
-    }]
-  },
-  options: {
-    responsive: true, maintainAspectRatio: false,
-    plugins: {
-      legend:{display:false},
-      tooltip:{callbacks:{label:c=>` ${c.parsed.y}% · ${plantStatus[c.dataIndex]||'N/A'}`}}
-    },
-    scales: {
-      y: { min:0, max:100, ticks:{font:{size:9,family:FONT},callback:v=>v+'%',stepSize:20}, grid:{color:gridColor} },
-      x: { ticks:{font:{size:10,family:FONT}}, grid:{display:false} }
-    }
-  }
-});
-
-// ── 4. Per-plant individual humidity line charts ─────────────────────────────
-const STATUS_PT = {Dry:'#c0430e', Ideal:'#1a6e3c', Humid:'#1656a3'};
-
-<?php foreach ($plantHumidityData as $pd): if (empty($pd['rows'])) continue; ?>
-(function() {
-  const rows = <?= json_encode($pd['rows']) ?>;
-  const labels = rows.map(r => {
-    const d = new Date(r.ts * 1000);
-    return d.toLocaleString('en-PH',{month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'Asia/Manila'});
-  });
-  const values = rows.map(r => parseFloat(r.humidity_percent));
-  const ptColors = rows.map(r => STATUS_PT[r.status] || '<?= $pd['color'] ?>');
-  new Chart(document.getElementById('plant-humidity-<?= $pd['pid'] ?>'), {
-    type: 'line',
-    data: {
-      labels,
-      datasets: [{
-        data: values,
-        borderColor: '<?= $pd['color'] ?>',
-        backgroundColor: '<?= $pd['color'] ?>12',
-        borderWidth: 2, fill: true, tension: 0.35,
-        pointRadius: values.length > 20 ? 2 : 3,
-        pointBackgroundColor: ptColors,
-        pointBorderColor: '#fff', pointBorderWidth: 1.5,
-      }]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend:{display:false}, tooltip:{callbacks:{label:c=>` ${c.parsed.y}%`}} },
-      scales: {
-        x: { ticks:{font:{size:7,family:FONT},maxTicksLimit:7,maxRotation:30,autoSkip:true}, grid:{display:false} },
-        y: { min:0, max:100, ticks:{font:{size:7,family:FONT},callback:v=>v+'%',stepSize:25}, grid:{color:gridColor} }
-      }
-    }
-  });
-})();
-<?php endforeach; ?>
 </script>
 </body>
 </html>

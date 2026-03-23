@@ -13,20 +13,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['new_plant_name'])) {
     $user_id = intval($_POST['plant_user_id']);
     $lat     = (isset($_POST['pin_lat']) && $_POST['pin_lat'] !== '') ? floatval($_POST['pin_lat']) : null;
     $lng     = (isset($_POST['pin_lng']) && $_POST['pin_lng'] !== '') ? floatval($_POST['pin_lng']) : null;
+
     if ($name && $city && $user_id) {
         $pdo->prepare("INSERT INTO plants (user_id, plant_name, city, latitude, longitude) VALUES (?,?,?,?,?)")
             ->execute([$user_id, $name, $city, $lat, $lng]);
-        $msg = "Plant '$name' added successfully" . ($lat ? " with map pin." : ".");
+        $msg = "Plant '{$name}' added successfully" . ($lat ? " with map pin." : ".");
 
-        // Activate user if they were pending/recommended
-        $statusCheck = $pdo->prepare("SELECT status FROM users WHERE user_id=?");
+        // Activate user if they were pending or recommended
+        $statusCheck = $pdo->prepare("SELECT status, username FROM users WHERE user_id=?");
         $statusCheck->execute([$user_id]);
-        $currentStatus = $statusCheck->fetchColumn();
-        if ($currentStatus === 'pending' || $currentStatus === 'recommended') {
+        $userRow = $statusCheck->fetch();
+
+        if ($userRow && in_array($userRow['status'], ['pending','recommended'], true)) {
+            $prevStatus = $userRow['status'];
             $pdo->prepare("UPDATE users SET status='active' WHERE user_id=?")->execute([$user_id]);
             // Mark admin notification as read
             $pdo->prepare("UPDATE notifications SET is_read=1 WHERE for_role='admin' AND ref_user_id=?")->execute([$user_id]);
-            $msg .= " User account has been activated. ✅";
+            // Notify the manager that the user is now active
+            notify_manager_activated($pdo, $user_id, $userRow['username']);
+            // Write audit log
+            log_status_change($pdo, $user_id, (int)$_SESSION['user_id'], $prevStatus, 'active',
+                "Plant '{$name}' assigned by admin.");
+            $msg .= " ✅ @{$userRow['username']} is now active.";
         }
     } else {
         $error = "Please fill in all required fields.";
@@ -48,9 +56,9 @@ if (isset($_GET['deleted'])) $msg = "Plant deleted successfully.";
 
 $users  = $pdo->query("SELECT user_id, username, COALESCE(status,'active') AS status FROM users WHERE role='user' ORDER BY username ASC")->fetchAll();
 
-// Pre-select user if coming from admin onboarding panel
 $preselect_uid      = intval($_GET['user_id']  ?? 0);
 $preselect_username = htmlspecialchars($_GET['username'] ?? '');
+
 $plants = $pdo->query("
     SELECT p.plant_id, p.plant_name, p.city, p.latitude, p.longitude, p.created_at,
            u.username,
@@ -72,6 +80,10 @@ $activePage = 'manage_plants';
 <link rel="stylesheet" href="../assets/css/style.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+.pending-badge{display:inline-flex;align-items:center;gap:5px;background:#fffbeb;border:1px solid #fcd34d;border-radius:20px;padding:2px 9px;font-size:.68rem;font-weight:700;color:#92400e;}
+.activation-banner{background:#f0f9ff;border:1px solid #7dd3fc;border-radius:8px;padding:12px 16px;font-size:.8rem;color:#0c4a6e;margin-bottom:14px;display:flex;align-items:flex-start;gap:8px;}
+</style>
 </head>
 <body class="role-admin">
 <div class="app-layout">
@@ -79,21 +91,27 @@ $activePage = 'manage_plants';
 
   <div class="main-content">
     <header class="topbar">
-      <div style="class="topbar-left" style="display:flex;align-items:center;gap:12px;"">
+      <div class="topbar-left">
         <button class="sb-toggle" onclick="openSidebar()">☰</button>
         <div class="topbar-title">Manage <span>Plants</span></div>
       </div>
     </header>
 
     <div class="page-body">
-
       <?php if ($msg):   ?><div class="alert alert-success">✅ <?= htmlspecialchars($msg) ?></div><?php endif; ?>
       <?php if ($error): ?><div class="alert alert-error">⚠️ <?= htmlspecialchars($error) ?></div><?php endif; ?>
 
       <div class="pg-header">
         <h1>Plants &amp; IoT Devices</h1>
-        <p>Add new plants with map pin locations, or delete existing ones</p>
+        <p>Add plants with map pin locations. Assigning a plant to a pending user activates their account.</p>
       </div>
+
+      <?php if ($preselect_uid): ?>
+      <div class="activation-banner">
+        🪴 <span>You are assigning plants to <strong>@<?= $preselect_username ?></strong>.
+        Their account will become <strong>Active</strong> as soon as you add the first plant.</span>
+      </div>
+      <?php endif; ?>
 
       <div class="plant-layout">
 
@@ -116,12 +134,20 @@ $activePage = 'manage_plants';
               <div class="form-row form-row-2" style="margin-bottom:12px;">
                 <div class="form-group">
                   <label>Assign to User</label>
-                  <select name="plant_user_id" required>
+                  <select name="plant_user_id" id="plant_user_id" required onchange="highlightPendingUser(this)">
                     <option value="">— Select user —</option>
                     <?php foreach ($users as $u): ?>
-                    <option value="<?= $u['user_id'] ?>"><?= htmlspecialchars($u['username']) ?></option>
+                    <option value="<?= $u['user_id'] ?>"
+                            data-status="<?= htmlspecialchars($u['status']) ?>"
+                            <?= $u['user_id'] === $preselect_uid ? 'selected' : '' ?>>
+                      <?= htmlspecialchars($u['username']) ?>
+                      <?php if (in_array($u['status'],['pending','recommended'])): ?>(<?= $u['status'] ?>)<?php endif; ?>
+                    </option>
                     <?php endforeach; ?>
                   </select>
+                  <div id="preselect-banner" style="display:none;margin-top:6px;" class="pending-badge">
+                    ⏳ This user is awaiting activation
+                  </div>
                 </div>
                 <div class="form-group">
                   <label>Plant Name</label>
@@ -133,7 +159,7 @@ $activePage = 'manage_plants';
                 <input type="text" name="new_city" id="new_city" required placeholder="Drop a pin to auto-fill →">
                 <div id="city-chip" style="margin-top:5px;"></div>
               </div>
-              <button type="submit" class="btn btn-primary btn-full">🌱 Add Plant</button>
+              <button type="submit" class="btn btn-primary btn-full">🌱 Add Plant &amp; Activate User</button>
             </form>
           </div>
 
@@ -207,16 +233,12 @@ function pointInPolygon(lat, lng, polygon) {
 }
 
 const map = L.map('pin-map');
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
-  attribution:'© OpenStreetMap contributors', maxZoom:18
-}).addTo(map);
-const boundaryPoly = L.polygon(MANOLO_POLYGON,{
-  color:'#3d6b4a',weight:2.5,opacity:0.9,fillColor:'#3d6b4a',fillOpacity:0.05,dashArray:'8,5'
-}).addTo(map).bindTooltip('Manolo Fortich, Bukidnon',{direction:'center'});
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap contributors',maxZoom:18}).addTo(map);
+const boundaryPoly = L.polygon(MANOLO_POLYGON,{color:'#3d6b4a',weight:2.5,opacity:0.9,fillColor:'#3d6b4a',fillOpacity:0.05,dashArray:'8,5'}).addTo(map).bindTooltip('Manolo Fortich, Bukidnon',{direction:'center'});
 map.fitBounds(boundaryPoly.getBounds(),{padding:[12,12]});
 
 const existingPlants = <?= json_encode(array_values(array_filter($plants,fn($p)=>$p['latitude']&&$p['longitude']))) ?>;
-const statusColors = {dry:'#c05020',ideal:'#3d6b4a',humid:'#2d63a0','':"#8aa090"};
+const statusColors = {dry:'#c05020',ideal:'#3d6b4a',humid:'#2d63a0','':'#8aa090'};
 existingPlants.forEach(p=>{
   const color=statusColors[(p.last_status||'').toLowerCase()]||'#8aa090';
   const icon=L.divIcon({className:'',html:`<div style="background:${color};width:18px;height:18px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);border:2px solid white;box-shadow:0 1px 4px rgba(0,0,0,.3);"></div>`,iconSize:[18,18],iconAnchor:[9,18]});
@@ -236,7 +258,7 @@ map.on('click',function(e){
   const footer=document.getElementById('map-footer');
   const statusBox=document.getElementById('pin-status-box');
   if(!inside){
-    currentPin.bindPopup('<div style="color:#c05020;font-weight:600;">⛔ Outside the Polygon Map</div><div style="font-size:.75rem;color:#666;margin-top:3px;">Please place the pin inside the boundary.</div>').openPopup();
+    currentPin.bindPopup('<div style="color:#c05020;font-weight:600;">⛔ Outside the Polygon Map</div>').openPopup();
     document.getElementById('pin_lat').value='';
     document.getElementById('pin_lng').value='';
     document.getElementById('coords-strip').classList.remove('visible');
@@ -291,8 +313,9 @@ function highlightPendingUser(sel) {
   const opt = sel.options[sel.selectedIndex];
   const status = opt ? opt.getAttribute('data-status') : '';
   const banner = document.getElementById('preselect-banner');
-  if (banner) banner.style.display = (status === 'pending' || status === 'recommended') ? 'flex' : 'none';
+  if (banner) banner.style.display = (status === 'pending' || status === 'recommended') ? 'inline-flex' : 'none';
 }
+
 // Auto-highlight on load if preselected
 (function(){
   const sel = document.getElementById('plant_user_id');
