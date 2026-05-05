@@ -3,32 +3,47 @@ session_start();
 if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'admin') {
     header("Location: index.php"); exit;
 }
-require 'config.php';
+require 'config.php'; // Sets Asia/Manila timezone
 
 $msg = $error = "";
 
+// Create user
 if ($_POST && isset($_POST['new_username'])) {
     $u = trim($_POST['new_username']);
     $e = trim($_POST['new_email']);
-    $p = password_hash($_POST['new_password'], PASSWORD_DEFAULT);
+    $p = $_POST['new_password'];
     $r = $_POST['new_role'];
-    try {
-        $pdo->prepare("INSERT INTO users (username, email, password, role) VALUES (?,?,?,?)")
-            ->execute([$u, $e, $p, $r]);
-        $msg = "User '$u' created successfully.";
-    } catch (PDOException $ex) {
-        $error = "Username or email already exists.";
+    if (!in_array($r, ['admin','manager','user'], true)) $r = 'user';
+    // FIX: validate non-empty inputs before inserting
+    if ($u === '' || $e === '' || $p === '') {
+        $error = "All fields are required.";
+    } else {
+        try {
+            $pdo->prepare("INSERT INTO users (username, email, password, role) VALUES (?,?,?,?)")
+                ->execute([$u, $e, password_hash($p, PASSWORD_DEFAULT), $r]);
+            $msg = "User '$u' created successfully.";
+        } catch (PDOException $ex) {
+            $error = "Username or email already exists.";
+        }
     }
 }
 
+// Update role
 if ($_POST && isset($_POST['update_role'])) {
+    $newRole = $_POST['role'];
+    if (!in_array($newRole, ['admin','manager','user'], true)) $newRole = 'user';
     $pdo->prepare("UPDATE users SET role = ? WHERE user_id = ?")
-        ->execute([$_POST['role'], $_POST['uid']]);
+        ->execute([$newRole, intval($_POST['uid'])]);
     $msg = "Role updated.";
 }
 
+// Delete user
 if (($_GET['action'] ?? '') === 'delete' && isset($_GET['id'])) {
-    $pdo->prepare("DELETE FROM users WHERE user_id = ?")->execute([$_GET['id']]);
+    $id = intval($_GET['id']);
+    // FIX: also guard against deleting yourself via URL manipulation
+    if ($id && $id !== (int)$_SESSION['user_id']) {
+        $pdo->prepare("DELETE FROM users WHERE user_id = ?")->execute([$id]);
+    }
     header("Location: manage_users.php?deleted=1"); exit;
 }
 if (isset($_GET['deleted'])) $msg = "User deleted successfully.";
@@ -42,6 +57,9 @@ $users = $pdo->query("SELECT user_id, username, email, role, created_at FROM use
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Manage Users – SuccuTrack</title>
 <link rel="stylesheet" href="style.css">
+<style>
+.badge-manager { background:#f0eaff; color:#6b3ec8; border:1px solid #d4baff; }
+</style>
 </head>
 <body>
 <nav class="navbar">
@@ -77,6 +95,7 @@ $users = $pdo->query("SELECT user_id, username, email, role, created_at FROM use
         <label>Role</label>
         <select name="new_role">
           <option value="user">User</option>
+          <option value="manager">Manager</option>
           <option value="admin">Admin</option>
         </select>
       </div>
@@ -86,10 +105,11 @@ $users = $pdo->query("SELECT user_id, username, email, role, created_at FROM use
 
   <div class="card">
     <h2>All Users <span class="user-count"><?= count($users) ?></span></h2>
+    <p class="subtitle">Timestamps in Asia/Manila (PHT, UTC+8)</p>
     <div style="overflow-x:auto;">
     <table class="det-table">
       <thead>
-        <tr><th>#</th><th>Username</th><th>Email</th><th>Role</th><th>Joined</th><th>Action</th></tr>
+        <tr><th>#</th><th>Username</th><th>Email</th><th>Role</th><th>Joined (PHT)</th><th>Action</th></tr>
       </thead>
       <tbody>
         <?php foreach ($users as $u): ?>
@@ -102,17 +122,20 @@ $users = $pdo->query("SELECT user_id, username, email, role, created_at FROM use
               <input type="hidden" name="uid" value="<?= $u['user_id'] ?>">
               <input type="hidden" name="update_role" value="1">
               <select name="role" onchange="this.form.submit()" class="role-select">
-                <option value="user"  <?= $u['role']==='user'  ? 'selected':'' ?>>user</option>
-                <option value="admin" <?= $u['role']==='admin' ? 'selected':'' ?>>admin</option>
+                <option value="user"    <?= $u['role']==='user'    ? 'selected':'' ?>>user</option>
+                <option value="manager" <?= $u['role']==='manager' ? 'selected':'' ?>>manager</option>
+                <option value="admin"   <?= $u['role']==='admin'   ? 'selected':'' ?>>admin</option>
               </select>
             </form>
           </td>
+          <!-- FIX: date() uses Asia/Manila (set by config.php) -->
           <td><?= date('M d, Y', strtotime($u['created_at'])) ?></td>
           <td>
             <?php if ($u['user_id'] !== $_SESSION['user_id']): ?>
+            <!-- FIX: ENT_QUOTES prevents XSS in onclick confirm string -->
             <a href="manage_users.php?action=delete&id=<?= $u['user_id'] ?>"
                class="btn btn-sm btn-danger"
-               onclick="return confirm('Delete <?= htmlspecialchars($u['username']) ?>?')">Delete</a>
+               onclick="return confirm('Delete <?= htmlspecialchars($u['username'], ENT_QUOTES) ?>?')">Delete</a>
             <?php else: ?>
             <span style="color:var(--text-3);font-size:.78rem;">You</span>
             <?php endif; ?>

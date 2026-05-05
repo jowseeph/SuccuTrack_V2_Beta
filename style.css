@@ -49,7 +49,7 @@ body {
   justify-content: space-between;
   position: sticky;
   top: 0;
-  z-index: 200;
+  z-index: 1000;
   box-shadow: 0 1px 0 var(--border);
 }
 .nav-brand {
@@ -81,7 +81,7 @@ body {
 
 /* ── Layout ── */
 .container {
-  max-width: 960px;
+  max-width: 1000px;
   margin: 0 auto;
   padding: 28px 20px 72px;
 }
@@ -214,11 +214,12 @@ body {
   margin-top: 5px;
   font-weight: 500;
 }
-.stat-total { border-top: 3px solid var(--green-md);  }
-.stat-dry   { border-top: 3px solid var(--dry-bd);    }
-.stat-ideal { border-top: 3px solid var(--ideal-bd);  }
-.stat-humid { border-top: 3px solid var(--humid-bd);  }
-.stat-users { border-top: 3px solid #d4b8f0;          }
+.stat-total  { border-top: 3px solid var(--green-md);  }
+.stat-dry    { border-top: 3px solid var(--dry-bd);    }
+.stat-ideal  { border-top: 3px solid var(--ideal-bd);  }
+.stat-humid  { border-top: 3px solid var(--humid-bd);  }
+.stat-users  { border-top: 3px solid #d4b8f0;          }
+.stat-plants { border-top: 3px solid #a8d5b5;          }
 
 /* ── Plant Card (user dashboard) ── */
 .plant-card {
@@ -330,12 +331,13 @@ body {
   letter-spacing: .04em;
   text-transform: uppercase;
 }
-.badge-dry   { background: var(--dry-bg);   color: var(--dry);   border: 1px solid var(--dry-bd);   }
-.badge-ideal { background: var(--ideal-bg); color: var(--ideal); border: 1px solid var(--ideal-bd); }
-.badge-humid { background: var(--humid-bg); color: var(--humid); border: 1px solid var(--humid-bd); }
-.badge-admin { background: #fef9ec; color: #8a6200; border: 1px solid #f0dfa0; }
-.badge-user  { background: var(--green-lt); color: var(--green); border: 1px solid var(--green-md); }
-.badge-lg    { font-size: .76rem; padding: 4px 13px; }
+.badge-dry     { background: var(--dry-bg);   color: var(--dry);   border: 1px solid var(--dry-bd);   }
+.badge-ideal   { background: var(--ideal-bg); color: var(--ideal); border: 1px solid var(--ideal-bd); }
+.badge-humid   { background: var(--humid-bg); color: var(--humid); border: 1px solid var(--humid-bd); }
+.badge-admin   { background: #fef9ec; color: #8a6200; border: 1px solid #f0dfa0; }
+.badge-manager { background: #f0eaff; color: #6b3ec8; border: 1px solid #d4baff; }
+.badge-user    { background: var(--green-lt); color: var(--green); border: 1px solid var(--green-md); }
+.badge-lg      { font-size: .76rem; padding: 4px 13px; }
 
 /* ── Table ── */
 .table-wrap { overflow-x: auto; }
@@ -465,13 +467,110 @@ body {
 .pulse       { animation: pulseAnim .5s ease; }
 @keyframes pulseAnim { 0%,100%{transform:scale(1);} 50%{transform:scale(1.015);} }
 
+/* ── Plant Mini Stats ── */
+.plant-mini-stats {
+  display: flex;
+  gap: 10px;
+  margin: 10px 0 12px;
+}
+.mini-stat {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  text-align: center;
+  border-top: 2px solid var(--green-md);
+}
+.mini-dry   { border-top-color: var(--dry-bd); }
+.mini-ideal { border-top-color: var(--ideal-bd); }
+.mini-humid { border-top-color: var(--humid-bd); }
+.mini-val {
+  display: block;
+  font-family: 'DM Serif Display', serif;
+  font-size: 1.3rem;
+  line-height: 1;
+  color: var(--text);
+}
+.mini-lbl {
+  display: block;
+  font-size: .65rem;
+  color: var(--text-3);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  margin-top: 4px;
+}
+
+/* ── Humidity Trend Chart ── */
+.chart-wrap {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  margin: 12px 0;
+}
+.chart-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.chart-title {
+  font-size: .78rem;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.chart-count {
+  font-size: .7rem;
+  color: var(--text-3);
+}
+.chart-empty {
+  font-size: .78rem;
+  color: var(--text-3);
+  font-style: italic;
+  text-align: center;
+  padding: 20px 0;
+}
+
+/* ── Add Plant Form ── */
+.add-plant-form {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 0 20px;
+  align-items: end;
+}
+.add-plant-form .btn { margin-top: 4px; }
+
+/* ── Chart Legend ── */
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin-top: 12px;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: .75rem;
+  color: var(--text-2);
+  font-weight: 500;
+}
+.legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
 /* ── Responsive ── */
 @media (max-width: 700px) {
-  .two-col       { grid-template-columns: 1fr; }
-  .stats-row     { grid-template-columns: repeat(3, 1fr); }
-  .add-user-form { grid-template-columns: 1fr; }
-  .add-user-form .btn { grid-column: span 1; }
-  .navbar        { padding: 0 14px; }
-  .container     { padding: 16px 12px 48px; }
-  .auth-card     { padding: 30px 20px; }
+  .two-col        { grid-template-columns: 1fr; }
+  .stats-row      { grid-template-columns: repeat(3, 1fr); }
+  .add-user-form  { grid-template-columns: 1fr; }
+  .add-plant-form { grid-template-columns: 1fr; }
+  .navbar         { padding: 0 14px; }
+  .container      { padding: 16px 12px 48px; }
+  .auth-card      { padding: 30px 20px; }
 }

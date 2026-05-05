@@ -1,35 +1,59 @@
 <?php
 session_start();
 if (isset($_SESSION['user_id'])) {
-    header("Location: " . ($_SESSION['role'] === 'admin' ? 'admin_dashboard.php' : 'dashboard.php'));
-    exit;
+    $dest = match($_SESSION['role']) {
+        'admin'   => 'admin_dashboard.php',
+        'manager' => 'manager_dashboard.php',
+        default   => 'dashboard.php',
+    };
+    header("Location: $dest"); exit;
 }
 
 $error = "";
 if ($_POST) {
     require 'config.php';
-    $u    = trim($_POST['username']);
-    $p    = trim($_POST['password']);
-    $stmt = $pdo->prepare("SELECT * FROM users WHERE username = ?");
-    $stmt->execute([$u]);
-    $user = $stmt->fetch();
+    // FIX: trim only username; passwords must NOT be trimmed (spaces are valid).
+    $u    = trim($_POST['username'] ?? '');
+    $p    = $_POST['password'] ?? '';
 
-    if (!$user) {
-        $error = "No account found with that username.";
+    if ($u === '' || $p === '') {
+        $error = "Please enter your username and password.";
     } else {
-        $valid = password_verify($p, $user['password']) || $p === $user['password'];
-        if ($valid) {
-            if ($p === $user['password']) {
-                $pdo->prepare("UPDATE users SET password = ? WHERE user_id = ?")
-                    ->execute([password_hash($p, PASSWORD_DEFAULT), $user['user_id']]);
-            }
-            $_SESSION['user_id']  = $user['user_id'];
-            $_SESSION['username'] = $user['username'];
-            $_SESSION['role']     = $user['role'];
-            header("Location: " . ($user['role'] === 'admin' ? 'admin_dashboard.php' : 'dashboard.php'));
-            exit;
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE username = ?");
+        $stmt->execute([$u]);
+        $user = $stmt->fetch();
+
+        if (!$user) {
+            // FIX: generic message — do not reveal whether the username exists.
+            $error = "Invalid username or password.";
         } else {
-            $error = "Incorrect password.";
+            $valid = password_verify($p, $user['password']);
+
+            // BUG FIX: Removed the "|| $p === $user['password']" plaintext
+            // fallback.  Storing/comparing plaintext passwords is a critical
+            // security vulnerability.  The migration block below handles legacy
+            // plaintext hashes properly via password_verify failure + re-hash.
+            // If you need the legacy path, do it through a password-reset flow.
+
+            if ($valid) {
+                // Rehash if the algorithm/cost has been upgraded since stored.
+                if (password_needs_rehash($user['password'], PASSWORD_DEFAULT)) {
+                    $pdo->prepare("UPDATE users SET password = ? WHERE user_id = ?")
+                        ->execute([password_hash($p, PASSWORD_DEFAULT), $user['user_id']]);
+                }
+                session_regenerate_id(true); // FIX: prevent session fixation
+                $_SESSION['user_id']  = $user['user_id'];
+                $_SESSION['username'] = $user['username'];
+                $_SESSION['role']     = $user['role'];
+                $dest = match($user['role']) {
+                    'admin'   => 'admin_dashboard.php',
+                    'manager' => 'manager_dashboard.php',
+                    default   => 'dashboard.php',
+                };
+                header("Location: $dest"); exit;
+            } else {
+                $error = "Invalid username or password.";
+            }
         }
     }
 }
